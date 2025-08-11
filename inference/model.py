@@ -379,11 +379,11 @@ class MLA(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, inter_dim: int):
+    def __init__(self, dim: int, intermediate_dim: int):
         super().__init__()
-        self.up_proj = ColumnParallelLinear(dim, inter_dim)
-        self.gate_proj = ColumnParallelLinear(dim, inter_dim)
-        self.down_proj = RowParallelLinear(inter_dim, dim)
+        self.up_proj = ColumnParallelLinear(dim, intermediate_dim)
+        self.down_proj = RowParallelLinear(intermediate_dim, dim)
+        self.gate_proj = ColumnParallelLinear(dim, intermediate_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 这个与llama的做法一些区别
@@ -430,44 +430,61 @@ class ExpertGate(nn.Module):
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
                 """
-                amax等价于 torch.max(scores, dim=-1).values
+                amax等价于 torch.max(scores, dim=-1).values, 只返回最大值，不返回index
                 amax 在 CUDA 设备上会调用优化后的内核
                 """
-                # group_scores:[batch_size*seq_len, n_groups, 1]
-                group_scores = scores.amax(dim=-1)
+                # scores:[batch_size*seq_len, n_groups, n_routed_experts//n_groups]
+                # =>
+                # group_scores:[batch_size*seq_len, n_groups]
+                group_scores = scores.amax(dim=-1) # amax会降维
             else:
-                # group_scores:[batch_size,*seq_len,n_groups, 1]
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                # group_scores:[batch_size,*seq_len, n_groups]
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # sum会降维
+
+            # topk_inds:[batch_size,*seq_len, n_groups]
+            topk_inds = group_scores.topk(self.topk_groups, dim=-1)[1]
+
             """
-            目标：从 scores 张量中提取每组（group）的前 topk_groups 个最高得分，并通过掩码（mask）将这些位置保留，其余位置置零。
-            输入：
-            scores：形状为 [batch_size*seq_len, n_groups, n_routed_experts/n_groups] 的张量，表示每个组的得分。
-            group_scores：每组得分的汇总（如最大值或平均值）。
-            输出：处理后的 scores，仅保留每组前 topk_groups 个最高得分的位置。
-            将 src（这里是 True）按 index（indices）填充到 mask 的指定位置。
-            
             scores:[batch_size*seq_len, n_groups, n_routed_experts/n_groups]
+                => scores[...,0]是只取第0个group的score, [batch_size*seq_len, n_groups]
+            topk_inds:[batch_size,*seq_len, n_groups]
+            
+            tensor.scatter_(dim, index, src):
+            要求： src.shape == index.shape.
+                self[index[i][j][k]] [j][k] = src[i][j][k]  # if dim == 0
+                self[i] [index[i][j][k]] [k] = src[i][j][k]  # if dim == 1
+                self[i][j] [index[i][j][k]] = src[i][j][k]  # if dim == 2
+            
+            相反的操作：一般用在从input中选topk元素
+            torch.gather(input, dim, index)
+            要求： src.shape == index.shape.
+                out[i][j][k] = input[index[i][j][k]][j][k]  # if dim == 0
+                out[i][j][k] = input[i][index[i][j][k]][k]  # if dim == 1
+                out[i][j][k] = input[i][j][index[i][j][k]]  # if dim == 2
+
+            =>
             mask:[batch_size*seq_len, n_groups]
             """
-            mask = torch.zeros_like(scores[..., 0]).scatter_(dim=1, index=indices, src=True)
+            mask = torch.zeros_like(scores[..., 0]).scatter_(dim=1, index=topk_inds, src=True)
             # scores:[batch_size*seq_len, n_groups, n_routed_experts/n_groups]
             # => [batch_size*seq_len, n_routed_experts]
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+            scores = (scores * mask.unsqueeze(-1)).flatten(1) # mask=0处均被设为0
 
         # scores:[batch_size*seq_len, n_routed_experts=64]
-        # => indices [batch_size*seq_len, topk=6]
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        # => topk_inds [batch_size*seq_len, topk=6]
+        topk_inds = torch.topk(scores, self.topk, dim=-1)[1]
 
-        # 从dim=1上用indices去收集scores
+        # 从dim=1上用indices去收集topk scores作为weights
         # weights:[batch_size*seq_len, topk=6]
-        weights = original_scores.gather(dim=1, index=indices)
+        weights = original_scores.gather(dim=1, index=topk_inds)
         if self.score_func == "sigmoid":
-            weights /= weights.sum(dim=-1, keepdim=True)
+            # weights:[batch_size*seq_len, 6]
+            weights /= weights.sum(dim=-1, keepdim=True) # 如果是sigmoid, 则需要归一化为1, 才是真正的概率
 
         # weights:[batch_size*seq_len, topk=6]
+        # topk_inds [batch_size*seq_len, topk=6]
         weights *= self.route_scale
-        return weights.type_as(x), indices
+        return weights.type_as(x), topk_inds
 
 
 class Expert(nn.Module):
@@ -494,33 +511,79 @@ class MoE(nn.Module):
         self.expert_gate = ExpertGate(args)
         self.experts:List[Expert] = nn.ModuleList([Expert(args.dim, args.moe_intermediate_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
-        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_intermediate_dim)
+        # 将多个专家的参数合并到一个MLP的中间层中了
+        self.shared_experts = MLP(dim=args.dim, intermediate_dim=args.n_shared_experts * args.moe_intermediate_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, seq_len, dim]
         shape = x.size()
         # x: [batch*seq_len, dim]
         x = x.view(-1, self.dim)
-        # weights:[batch_size*seq_len, topk=6]
+        """
+        先对gate进行前向传播，从gate中选出每个token的topK的专家，然后只对各个token的topK的专家进行前向传播
+        """
+        # gate_weights:[batch_size*seq_len, topk=6]
         # indices:[batch_size*seq_len, topk=6]
-        weights, indices = self.expert_gate.forward(x)
-        y = torch.zeros_like(x)
+        gate_weights, indices = self.expert_gate.forward(x)
+        routed_experts_score = torch.zeros_like(x)
+
+        """
+        # 假设有 4 个专家（n_routed_experts = 4）
+        self_n_routed_experts = 4
+        # indices 表示每个 token 被路由到哪个专家
+        indices = torch.tensor([[0, 1], [1, 3], [0, 2]])
+        # 统计每个专家被选中的次数
+        counts = torch.bincount(indices.flatten(), minlength=self_n_routed_experts).tolist()
+        print(counts)  # 输出: [2, 2, 1, 1]
+        """
+        # 给每个专家计数
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        # NOTE：专家路由时，使用的是for,而不是固定的矩阵相乘后再mask
+
+        # NOTE：专家路由时，使用的是for,而不是固定的矩阵相乘后再mask, 这样可以节省计算量
         for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
+            if counts[i] == 0: # 若该专家没有被选中，则跳过
                 continue
             expert = self.experts[i]
+            # indices:[batch_size*seq_len, topk=6]
+            """
+            对于二维张量，它会返回两个一维张量：
+                idx:第一个：满足条件的行索引（比如 batch 中的第几个样本）
+                top:第二个：满足条件的列索引（比如在 top-k 中的第几个位置）
+                
+            indices = torch.tensor([
+                [0, 1],
+                [1, 2],
+                [0, 2], # 注意：第2个样本没有选择专家1
+                [1, 1]
+            ])  # 形状: [4, 2]
+
+            i = 1
             idx, top = torch.where(indices == i)
-            y[idx] += expert.forward(x[idx]) * weights[idx, top, None]
+
+            print(idx)  # tensor([0, 1, 3, 3])   -> 第0、1、3、3个样本
+            print(top)  # tensor([1, 0, 0, 1])   -> 在这些样本中，是第1、0、0、1个位置
+            所以专家 1 被样本 [0,1,3,3] 选中，分别是在它们的 top-k 路由中的第 [1,0,0,1] 位。
+            """
+            idx, top = torch.where(indices == i)
+            # x: [batch*seq_len, dim]
+            # x[ios]: [tokens_select_expert, dim]
+            # gate_weights[idx, top]:[token_select_expert]
+            # gate_weights[idx, top, None] => [token_select_expert, 1]
+            # expert_score: [tokens_select_expert, dim]
+            expert_score = expert.forward(x[idx])
+            # NOTE："+=", 这里是各专家对各样本的权重累加
+            routed_experts_score[idx] += expert_score * gate_weights[idx, top, None]
 
         # 还有一个共享专家，是一定需要计算的
         # x: [batch*seq_len, dim]
-        # z: [batch*seq_len, n_shared_experts*moe_intermediate_dim]
-        z = self.shared_experts(x)
+        # shared_experts_score: [batch*seq_len, dim]
+        shared_experts_score = self.shared_experts.forward(x)
         if world_size > 1:
-            dist.all_reduce(y)
-        return (y + z).view(shape)
+            dist.all_reduce(routed_experts_score, op=dist.ReduceOp.SUM)
+        # routed_experts_score: [batch*seq_len, dim]
+        # shared_experts_score: [batch*seq_len, dim]
+        # => return [batch, seq_len, dim]
+        return (routed_experts_score + shared_experts_score).view(shape)
 
 
 class Block(nn.Module):
@@ -532,12 +595,14 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(args.dim)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # rms_norm + casual_attention + resudial
+        """
+        NOTE：这里并没有dropout
+        """
+        # pre_rms_norm + casual_attention + resudial
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        # rms_norm + mlp + resudial
+        # pre_rms_norm + mlp + residual
         x = x + self.ffn(self.ffn_norm(x))
         return x
-
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
