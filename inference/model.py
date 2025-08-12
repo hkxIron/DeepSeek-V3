@@ -503,10 +503,10 @@ class MoE(nn.Module):
         super().__init__()
         self.dim = args.dim
         assert args.n_routed_experts % world_size == 0
-        self.n_routed_experts = args.n_routed_experts # 路由的专家有61个
-        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_routed_experts = args.n_routed_experts # 路由的专家有64个
+        self.n_local_experts = args.n_routed_experts // world_size # 假设world_size=4, 则n_local_experts = 16
         self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_start_idx = rank * self.n_local_experts # 每个进程只处理部分专家
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.expert_gate = ExpertGate(args)
         self.experts:List[Expert] = nn.ModuleList([Expert(args.dim, args.moe_intermediate_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
@@ -525,6 +525,7 @@ class MoE(nn.Module):
         # gate_weights:[batch_size*seq_len, topk=6]
         # indices:[batch_size*seq_len, topk=6]
         gate_weights, indices = self.expert_gate.forward(x)
+        # routed_experts_score: [batch*seq_len, dim]
         routed_experts_score = torch.zeros_like(x)
 
         """
@@ -539,7 +540,8 @@ class MoE(nn.Module):
         # 给每个专家计数
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
 
-        # NOTE：专家路由时，使用的是for,而不是固定的矩阵相乘后再mask, 这样可以节省计算量
+        # NOTE： 1. 专家路由时，使用的是for,而不是固定的矩阵相乘后再mask, 这样可以节省计算量
+        #       2. 此处使用了专家并行,只处理当前world_index上的专家, 不同的专家放在不同的rank上
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0: # 若该专家没有被选中，则跳过
                 continue
@@ -547,8 +549,8 @@ class MoE(nn.Module):
             # indices:[batch_size*seq_len, topk=6]
             """
             对于二维张量，它会返回两个一维张量：
-                idx:第一个：满足条件的行索引（比如 batch 中的第几个样本）
-                top:第二个：满足条件的列索引（比如在 top-k 中的第几个位置）
+                sample_idx:第一个：满足条件的行索引（比如 batch 中的第几个样本）
+                select_expert_idx:第二个：满足条件的列索引（比如在 select_expert_idx-k 中的第几个位置）
                 
             indices = torch.tensor([
                 [0, 1],
@@ -558,21 +560,21 @@ class MoE(nn.Module):
             ])  # 形状: [4, 2]
 
             i = 1
-            idx, top = torch.where(indices == i)
+            sample_idx, select_expert_idx = torch.where(indices == i)
 
-            print(idx)  # tensor([0, 1, 3, 3])   -> 第0、1、3、3个样本
-            print(top)  # tensor([1, 0, 0, 1])   -> 在这些样本中，是第1、0、0、1个位置
-            所以专家 1 被样本 [0,1,3,3] 选中，分别是在它们的 top-k 路由中的第 [1,0,0,1] 位。
+            print(sample_idx)  # tensor([0, 1, 3, 3])   -> 第0、1、3、3个样本
+            print(select_expert_idx)  # tensor([1, 0, 0, 1])   -> 在这些样本中，是第1、0、0、1个位置
+            所以专家 1 被样本 [0,1,3,3] 选中，分别是在它们的 select_expert_idx-k 路由中的第 [1,0,0,1] 位。
             """
-            idx, top = torch.where(indices == i)
+            sample_idx, select_expert_idx = torch.where(indices == i)
             # x: [batch*seq_len, dim]
-            # x[ios]: [tokens_select_expert, dim]
-            # gate_weights[idx, top]:[token_select_expert]
-            # gate_weights[idx, top, None] => [token_select_expert, 1]
-            # expert_score: [tokens_select_expert, dim]
-            expert_score = expert.forward(x[idx])
+            # x[sample_idx]: [token_idx, dim]
+            # gate_weights[token_idx, select_expert_idx].shape = [token_idx]
+            # gate_weights[token_idx, select_expert_idx, None] => [token_id, 1]
+            # expert_score: [token_idx, dim]
+            expert_score = expert.forward(x[sample_idx])
             # NOTE："+=", 这里是各专家对各样本的权重累加
-            routed_experts_score[idx] += expert_score * gate_weights[idx, top, None]
+            routed_experts_score[sample_idx] += expert_score * gate_weights[sample_idx, select_expert_idx, None]
 
         # 还有一个共享专家，是一定需要计算的
         # x: [batch*seq_len, dim]
@@ -583,6 +585,7 @@ class MoE(nn.Module):
         # routed_experts_score: [batch*seq_len, dim]
         # shared_experts_score: [batch*seq_len, dim]
         # => return [batch, seq_len, dim]
+        # NOTE: 共享专家+路由专家的权重
         return (routed_experts_score + shared_experts_score).view(shape)
 
 
@@ -598,7 +601,7 @@ class Block(nn.Module):
         """
         NOTE：这里并没有dropout
         """
-        # pre_rms_norm + casual_attention + resudial
+        # pre_rms_norm + casual_attention + residual
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
         # pre_rms_norm + mlp + residual
         x = x + self.ffn(self.ffn_norm(x))
