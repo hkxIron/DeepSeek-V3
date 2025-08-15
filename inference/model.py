@@ -54,7 +54,7 @@ class ModelArgs:
     rope_factor: float = 40
     beta_fast: int = 32
     beta_slow: int = 1
-    mscale: float = 1.
+    mscale: float = 1. # 新的length是原length的多少倍
 
 
 """
@@ -178,15 +178,21 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    """
+    rmsnorm: y = x / std(x) * alpha, 注意，没有减均值
+    """
     def forward(self, x: torch.Tensor):
         # x: [batch_size, seq_len, hidden_dim]
         x = x.float()
         # rsqrt: 用于计算输入张量元素的平方根的倒数, 等价于1/torch.sqrt(x)，但 torch.rsqrt 通常经过优化，计算效率更高（尤其在GPU上）。
+        # std(x) = sqrt(sum(x^2)/n)
         normed_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) # 只除了标准差
         return normed_x.type_as(self.weight) * self.weight
 
 """
 注意：这里也用到了yarn rope
+
+计算theta_d(seq_len, dim//2)
 """
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     dim = args.qk_rope_head_dim
@@ -219,30 +225,36 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         inv_freqs = inv_freqs / factor * (1 - smooth) + inv_freqs * smooth
 
-    # t: [0, 1, 2, ,,,,, seq_len-1], shape[seq_len]
-    t = torch.arange(seqlen)
-    # inv_freqs: [seq_len, dim//2]
-    position_dim_theta = torch.outer(t, inv_freqs)
+    # position_idx: [0, 1, 2, ,,,,, seq_len-1], shape[seq_len]
+    position_idx = torch.arange(seqlen)
+    # theta_d = inv_freqs: [seq_len, dim//2]
+    position_dim_theta = torch.outer(position_idx, inv_freqs)
+
     # 生成旋转复向量，[seq_len, dim//2], 不同位置不同维度的旋转复向量不同
-    freqs_cis = torch.polar(abs=torch.ones_like(inv_freqs), angle=position_dim_theta)
+    # freqs_cis = torch.polar(abs=torch.ones_like(inv_freqs), angle=position_dim_theta)
+    # freq_cis: [seq_len, dim//2]
+    freqs_cis = torch.polar(abs=torch.ones_like(position_dim_theta), angle=position_dim_theta)
     return freqs_cis
 
-
+"""
+对x进行旋转复向量freqs_cis角度操作
+"""
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     dtype = x.dtype
     # x: [bsz, seqlen, n_local_heads, qk_head_dim]
     # =>view: [bsz, seqlen, n_local_heads, qk_head_dim//2, 2], 将最后一个维度拆成[head_dim//2, 2]， 最后一维的2个维度分别对应复数实部和虚部
     # =>view_as_complex: [bsz, seqlen, n_local_heads, qk_head_dim//2, 2]
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    # freqs_cis.view: [bsz=1, seq_len, n_local_heads=1, dim//2], 旋转复向量
+    # freqs_cis: [seq_len, dim//2]
+    # => freqs_cis.view: [bsz=1, seq_len, n_local_heads=1, dim//2], 旋转复向量
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    # rotated_x: 对x向量进行旋转，在复数域内相乘后，又恢复成实数域
+
+    # rotated_x: 对x向量进行旋转角度freq_cis，在复数域内相乘后，又恢复成实数域
     # [bsz, seqlen, n_local_heads, qk_head_dim//2, 2]
     # =>view_as_real: [bsz, seqlen, n_local_heads, qk_head_dim//2, 2]
     # => flatten(3):  [bsz, seqlen, n_local_heads, qk_head_dim]
     rotated_x = torch.view_as_real(x * freqs_cis).flatten(3)
     return rotated_x.to(dtype)
-
 
 """
 注意：MLA就昌借鉴了lora先降维再升维的思想， 所以里面的变量名都是lora_XX
@@ -250,15 +262,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 class MLA(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.dim = args.dim
-        self.n_heads = args.n_heads
+        self.dim = args.dim # 2048维
+        self.n_heads = args.n_heads # 16
         self.n_local_heads = args.n_heads // world_size
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.qk_nope_head_dim = args.qk_nope_head_dim #  无位置信息的向量
-        self.qk_rope_head_dim = args.qk_rope_head_dim # 有位置信息的向量
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
+        self.q_lora_rank = args.q_lora_rank #
+        self.kv_lora_rank = args.kv_lora_rank # kv low rank, 512
+        self.qk_nope_head_dim = args.qk_nope_head_dim # 无位置信息的向量, 128, 维度较高
+        self.qk_rope_head_dim = args.qk_rope_head_dim # 有位置信息的向量, 64, 维度较低
+        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim # qk_head_dim = 128+64 = 192维
+        self.v_head_dim = args.v_head_dim # 128
 
         if self.q_lora_rank == 0:
             # 不对q进行先降维再升维(低秩压缩)
@@ -278,6 +290,7 @@ class MLA(nn.Module):
 
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
+        # yarn放大系数计算
         if args.max_seq_len > args.original_seq_len:
             """
             yarn中：
@@ -287,48 +300,57 @@ class MLA(nn.Module):
             # 乘以在最后 softmax上，需要平方
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        # NOTE: 每层layer有自己的MLA, 每层都是固定内存分配的, 而不是动态分配的
         if attn_impl == "naive":
+            # k cache: [batch_size, max_seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim = 192]
+            # v cache: [batch_size, max_seq_len, n_local_heads, v_head_dim =128]
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
-        else:
+        else: # absorb, 吸收矩阵 W^(UQ).T * W(UK)
+            # kv cache
+            # kv_cache: [batch_size, max_seq_len, kv_lora_rank=512]
+            # pe_cache: [batch_size, max_seq_len, qk_rope_head_dim=64]
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
-        # x: [batch_size, seq_len, hidden_dim]
+        # x: [batch_size, query_seq_len, hidden_dim]
         batch_size, seq_len, hidden_size = x.size()
         # 在prefill阶段，可能seq_len>1
         # 但在decode阶段，seq_len=1
         end_pos = start_pos + seq_len
-        if self.q_lora_rank == 0: # 对q不使用MLA
+        if self.q_lora_rank == 0: # 对q不先降维再升维(低秩压缩)
+            # q: [batch_size, query_seq_len, n_heads*qk_head_dim]
             q = self.wq(x)
         else:
             # 对q使用MLA, 先降维再升维
-            # q: [batch_size, seq_len, hidden_dim]
+            # q: [batch_size, query_seq_len, n_heads*qk_head_dim]
             q = self.wq_b(self.q_norm(self.wq_a(x)))
 
+        # q: [batch_size, query_seq_len, n_local_heads, qk_head_dim]
         q = q.view(batch_size, seq_len, self.n_local_heads, self.qk_head_dim)
 
-        # q: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
-        # q_nope: 无位置信息的向量, [batch_size, seq_len, n_local_heads, qk_nope_head_dim]
-        # q_rope: 有位置信息的向量, [batch_size, seq_len, n_local_heads, qk_rope_head_dim]
+        # q: [batch_size, query_seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
+        # q_nope: 无位置信息的向量, [batch_size, query_seq_len, n_local_heads, qk_nope_head_dim=128]
+        # q_rope: 有位置信息的向量, [batch_size, query_seq_len, n_local_heads, qk_rope_head_dim=64]
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # q_rope: 有位置信息的向量, [batch_size, query_seq_len, n_local_heads, qk_rope_head_dim]
         q_rope = apply_rotary_emb(q_rope, freqs_cis)
 
         # kv: [batch_size, seq_len, dim= = kv_lora_rank + qk_rope_head_dim]
         kv = self.wkv_a(x)
-        # kv: [batch_size, seq_len, kv_lora_rank]
+        # kv: [batch_size, seq_len, kv_lora_rank=512]
         # kv_rope: [batch_size, seq_len, qk_rope_head_dim]
         kv, k_rope = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        # kv_rope: [batch_size, seq_len, head_num=1, qk_rope_head_dim]
+        # k_rope: [batch_size, seq_len, head_num=1, qk_rope_head_dim]
         k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
 
         if attn_impl == "naive":
-            # q_nope: 无位置信息的向量, [batch_size, seq_len, n_local_heads, qk_nope_head_dim]
-            # q_rope: 有位置信息的向量, [batch_size, seq_len, n_local_heads, qk_rope_head_dim]
-            # q: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
+            # q_nope: 无位置信息的向量, [batch_size, seq_len, n_local_heads, qk_nope_head_dim=128]
+            # q_rope: 有位置信息的向量, [batch_size, seq_len, n_local_heads, qk_rope_head_dim=64]
+            # q: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim=192]
             q = torch.cat([q_nope, q_rope], dim=-1)
-            # kv: [batch_size, seq_len, kv_lora_rank]
+            # kv: [batch_size, seq_len, kv_lora_rank=512]
             # => kv: [batch_size, seq_len, n_local_heads * (qk_nope_head_dim + v_head_dim)]
             kv = self.wkv_b(self.kv_norm(kv))
             # kv: [batch_size, seq_len, n_local_heads, (qk_nope_head_dim + v_head_dim)]
@@ -337,24 +359,51 @@ class MLA(nn.Module):
             # => k_nope: [batch_size, seq_len, n_local_heads, qk_nope_head_dim]
             # => v: [batch_size, seq_len, n_local_heads, v_head_dim]
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            # k: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
-            k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            # k_rope: [batch_size, seq_len, head_num=1, qk_rope_head_dim]
+            # k_rope.expand() => [batch_size, seq_len, n_local_heads, qk_rope_head_dim]
 
-            self.k_cache[:batch_size, start_pos:end_pos] = k # 更新kv cache缓存
+            # k: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
+            k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # NOTE:这里k_rope出现了广播，然后存储，浪费了内存
+
+            self.k_cache[:batch_size, start_pos:end_pos] = k # 更新kv cache缓存, 只更新当前位置的kv
             self.v_cache[:batch_size, start_pos:end_pos] = v
             # 即[s,d] @ [t, d].T => [s, t]
-            # q:[batch_size, query_seq_len, head_num, head_dim]
-            # k:[batch_size, key_seq_len, head_num, head_dim]
+            # q:[batch_size, query_seq_len, head_num, qk_head_dim=qk_nope_head_dim + qk_rope_head_dim=192]
+            # k_cached:[batch_size, key_seq_len, head_num, qk_head_dim=qk_nope_head_dim + qk_rope_head_dim=192] , 注意：此处是取出前面所有的kv
+            # => q@k =
             # scores:[batch_size, query_seq_len, head_num, key_seq_len]
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale
-        else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+        else: # absorb, 将W(UQ)_i.T@ W(UK)_i吸收在同一个低维矩阵q_nope中
+            # wkv_b: [n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank=512]
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
+            # wkv_b: [n_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank=512]
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+
+            # q_nope: 无位置信息的向量, [batch_size, seq_len, n_local_heads, qk_nope_head_dim=128]
+            # wkv_b[:, :self.qk_nope_head_dim]: [h_heads, qk_nope_head_dim, kv_lora_rank=512]
+            # => 最后两个维度上矩阵相乘
+            # q_nope:[batch_size, seq_len, n_local_heads, qk_nope_head_dim=128]
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+
+            # kv: [batch_size, key_seq_len, kv_lora_rank=512]
+            # kv_cache:[batch_size, key_seq_len, kv_lora_rank=512]
+            # pe_cache: [batch_size, key_seq_len, qk_rope_head_dim]
             self.kv_cache[:batch_size, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:batch_size, start_pos:end_pos] = k_rope.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:batch_size, :end_pos]) +
-                      torch.einsum("bshr,btr->bsht", q_rope, self.pe_cache[:batch_size, :end_pos])) * self.softmax_scale
+            # q_nope:[batch_size, query_seq_len, n_local_heads, qk_nope_head_dim=128]
+            # kv_cache:[batch_size, key_seq_len, kv_lora_rank=512]
+            # nope_score:[batch_size, query_seq_len, head_num, key_seq_len]
+            nope_score = torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:batch_size, :end_pos])
+
+            # q_rope: [batch_size, query_seq_len, n_local_heads, qk_rope_head_dim=64]
+            # pe_cache: [batch_size, key_seq_len, qk_rope_head_dim]
+            # => rope_score:[batch_size, query_seq_len, head_num, key_seq_len]
+            rope_score =torch.einsum("bshr,btr->bsht", q_rope, self.pe_cache[:batch_size, :end_pos])
+
+            # 将带位置信息的向量和无位置信息的向量拼接在一起
+            # socres:[batch_size, query_seq_len, head_num, key_seq_len]
+            scores = (nope_score + rope_score) * self.softmax_scale
+
         # 计算attention中的casual mask
         if mask is not None:
             scores += mask.unsqueeze(1) # mask掉的地方均为-inf
@@ -368,13 +417,20 @@ class MLA(nn.Module):
             #  => x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim]
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:batch_size, :end_pos])
         else:
+            # socres:[batch_size, query_seq_len, head_num, key_seq_len]
+            # kv_cache:[batch_size, key_seq_len, kv_lora_rank=512]
+            # => x: [batch_size, query_seq_len, head_num=n_local_heads, kv_local_rank=512]
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:batch_size, :end_pos])
+            # wkv_b: [n_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank=512]
+            # wkv_b[:,-self.v_head_dim:]: [n_heads, v_head_dim, kv_lora_rank=512]
+            # => x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim=128]
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
 
-        # x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim]
-        # flatten => [batch_size, query_seq_len, head_num * v_head_dim]
-        # => [batch_size, query_seq_len, dim]
-        x = self.wo(x.flatten(2))
+        # x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim=128]
+        # x.flatten => [batch_size, query_seq_len, head_num * v_head_dim], 将所有head的拼接在一起,然后再进行线性变换
+        # wo.T: [head_num * v_head_dim, dim=2048]
+        # => [batch_size, query_seq_len, dim=2048]
+        x = self.wo(x.flatten(start_dim=2, end_dim=-1))
         return x
 
 
@@ -389,7 +445,6 @@ class MLP(nn.Module):
         # 这个与llama的做法一些区别
         """
         llama: y = down( silu(gate(x)) * up(x) )
-
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         """
         return self.down_proj(F.silu(self.up_proj(x)) * self.gate_proj(x))
@@ -570,10 +625,10 @@ class MoE(nn.Module):
             # x: [batch*seq_len, dim]
             # x[sample_idx]: [token_idx, dim]
             # gate_weights[token_idx, select_expert_idx].shape = [token_idx]
-            # gate_weights[token_idx, select_expert_idx, None] => [token_id, 1]
+            #  => gate_weights[token_idx, select_expert_idx, None] => [token_idx, 1]
             # expert_score: [token_idx, dim]
             expert_score = expert.forward(x[sample_idx])
-            # NOTE："+=", 这里是各专家对各样本的权重累加
+            # NOTE："+=", 这里是各专家对各样本的加权打分的累加
             routed_experts_score[sample_idx] += expert_score * gate_weights[sample_idx, select_expert_idx, None]
 
         # 还有一个共享专家，是一定需要计算的
@@ -616,7 +671,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
-        self.layers = torch.nn.ModuleList()
+        self.layers:List[Block] = torch.nn.ModuleList()
 
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
@@ -629,6 +684,8 @@ class Transformer(nn.Module):
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         seqlen = tokens.size(1)
         h = self.embed(tokens)
+        # freq_cis = theta_d: [max_seq_len, dim//2]
+        # => freq_cis[start_pos:start_pos+seqlen]: [seqlen, dim//2]
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
 
