@@ -404,7 +404,7 @@ class MLA(nn.Module):
         self.v_head_dim = args.v_head_dim # 128
 
         if self.q_lora_rank == 0:
-            # 不对q进行先降维再升维(低秩压缩)
+            # NOTE:不对q进行先降维再升维(低秩压缩)
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
             # 对q进行先降维再升维(低秩压缩)
@@ -451,13 +451,17 @@ class MLA(nn.Module):
         # 但在decode阶段，seq_len=1
         end_pos = start_pos + seq_len
         if self.q_lora_rank == 0: # 对q不先降维再升维(低秩压缩)
-            # q: [batch_size, query_seq_len, n_heads*qk_head_dim]
+            # x: [batch_size, query_seq_len, hidden_dim]
+            # wq:[dim, n_heads*qk_head_dim]
+            # => NOTE: 综过wq的列权重并行后, q的维度是n_local_head*qk_head_dim, 而不是n_head*qk_head_dim, 需要细细体会
+            # q: [batch_size, query_seq_len, n_local_heads*qk_head_dim]
             q = self.wq(x)
         else:
             # 对q使用MLA, 先降维再升维
             # q: [batch_size, query_seq_len, n_heads*qk_head_dim]
             q = self.wq_b(self.q_norm(self.wq_a(x)))
 
+        # NOTE:当前rank上只有q的部分列,即 q: [batch_size, query_seq_len, n_local_head*qk_head_dim]
         # q: [batch_size, query_seq_len, n_local_heads, qk_head_dim]
         q = q.view(batch_size, seq_len, self.n_local_heads, self.qk_head_dim)
 
