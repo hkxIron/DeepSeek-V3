@@ -57,12 +57,11 @@ class ModelArgs:
     rope_factor: float = 40
     beta_fast: int = 32 # 旋转得快的周期
     beta_slow: int = 1 # 旋转得慢的周期
-    mscale: float = 1. # 新的length是原length的多少倍
+    mscale: float = 1. # 不知道是什调节因子，一般为1
 
 
 """
 目标：将完整的词表（vocab_size）均匀拆分到多个GPU上，每个GPU只存储一部分词向量，减少单卡显存占用。
-
 """
 class ParallelEmbedding(nn.Module):
     def __init__(self, vocab_size: int, dim: int):
@@ -141,7 +140,7 @@ class Linear(nn.Module):
         torch.int16 (short)	2
         torch.int8	1
         """
-        if self.weight.element_size() == 1:
+        if self.weight.element_size() == 1: # 8bit量化
             # weight只有一个字节，说明其为量化后的权重
             scale_out_features = (out_features + block_size - 1) // block_size # 向量取整整除，ceil(x/block_size)
             scale_in_features = (in_features + block_size - 1) // block_size
@@ -162,6 +161,7 @@ class ColumnParallelLinear(Linear):
     # NOTE:在wegiht输出维度上并行，因此称为列并行
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         assert out_features % world_size == 0
+        # NOTE:可以看到，列并行只是在输出维度上将向量分为多个块
         # 只使用部分输出维度，即out_features // world_size
         # weight:[in_features, out_feat/world_size]
         self.part_out_features = out_features // world_size
@@ -174,7 +174,6 @@ class ColumnParallelLinear(Linear):
         # y:[batch, seq_len, in_features/world_size]
         y = linear(x, self.weight, self.bias)
         return y
-
 
 class RowParallelLinear(Linear):
     # NOTE:在weight输入维度上并行，因此称为行并行
@@ -289,7 +288,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     这就是 find_correction_dim 的公式。
     """
     # NOTE: 对于维度i，最大序列长度max_seq_len内其对应的旋转周期个数为：num_rotations
-    def find_correction_dim(num_rotations:int, dim:int, base:float, max_seq_len:int):
+    def find_correction_dim_by_rotation_num(num_rotations:int, dim:int, base:float, max_seq_len:int):
         return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
 
     def find_correction_range(high_rotation_num:int,# dim越小, 旋转角度越大，旋转得越快, 高频
@@ -298,14 +297,17 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
                               base:float,
                               max_seq_len:int):
         # dim越小, 旋转角度越大，旋转得越快, 高频, 10
-        dim_of_high_rotation_num = math.floor(find_correction_dim(high_rotation_num, dim, base, max_seq_len))
+        dim_of_high_rotation_num = math.floor(find_correction_dim_by_rotation_num(high_rotation_num, dim, base, max_seq_len))
         # dim越大, 旋转角度越小，旋转得越慢, 低频, 23
-        dim_of_low_rotation_num = math.ceil(find_correction_dim(low_rotation_num, dim, base, max_seq_len))
+        dim_of_low_rotation_num = math.ceil(find_correction_dim_by_rotation_num(low_rotation_num, dim, base, max_seq_len))
         return max(dim_of_high_rotation_num, 0), min(dim_of_low_rotation_num, dim - 1)
 
     def linear_ramp_factor(low_dim:int, high_dim:int, dim:int):
         """
          NOTE: 生成非递减阶梯函数
+            0<x<low_dim: 0
+            low_dim<x<high_dim: (x-low_dim)/(high_dim-low_dim)
+            high_dim<x: 1
         """
         if low_dim == high_dim:
             high_dim += 0.001
@@ -319,6 +321,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     # freq shape: [dim / 2], 其值为: 1 / [ 10000 ^ (even_dim_index / dim) ], 只取偶数维度,
     # NOTE: 但freqs在tranformer的llama源码中叫inv_freqs, 但叫法并不准确，应访是频率
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    # NOTE:使用yarn rope
     if seqlen > args.original_seq_len:
         low_dim_of_fast_rotation, high_dim_of_low_rotation = find_correction_range(beta_fast_rotation, beta_slow_ratation, dim, base=base, max_seq_len=args.original_seq_len)
         """
@@ -357,7 +360,8 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     freqs_cis: [seq_len, dim//2]
     
     cis 是复数中表示 幅角为 θ 的单位复数 的简写形式，定义为：
-    cis(θ) = e^(iθ) =cos(θ ) + i*sin(θ)
+    cis(θ) = e^(iθ) = cos(θ ) + i*sin(θ)
+    即 c:cos, i: i, s: sin
     """
     freqs_cis = torch.polar(abs=torch.ones_like(position_dim_theta), angle=position_dim_theta)
     return freqs_cis
@@ -404,21 +408,23 @@ class MLA(nn.Module):
         self.v_head_dim = args.v_head_dim # 128
 
         if self.q_lora_rank == 0:
-            # NOTE:不对q进行先降维再升维(低秩压缩)
+            # NOTE:不对q进行先降维再升维(低秩压缩), 列并行
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
             # 对q进行先降维再升维(低秩压缩)
             # x * wq_a * wq_b, 就是MLA, 即先降维到latent空间，再升维
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(dim=self.q_lora_rank)
+            # NOTE: 列并行
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
 
-        # wkv_a降维
+        # NOTE: wkv_a降维
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        # wkv_b升维
+        # NOTE: wkv_b升维, 列并行
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
 
+        # NOTE:行并行
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         # yarn放大系数计算
@@ -426,10 +432,11 @@ class MLA(nn.Module):
             """
             yarn中：
             sqrt(1/t) = 0.1*ln(s) + 1.0, 它们是分别乘在query与key上的
+            s = L_new/L_old
             """
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
-            # 乘以在最后 softmax上，需要平方
-            self.softmax_scale = self.softmax_scale * mscale * mscale
+            # NOTE: 由于原始yarn放大系数是乘在query与key上的，所以乘以在最后 softmax时，需要平方
+            self.softmax_scale = self.softmax_scale * mscale**2
 
         # NOTE: 每层layer有自己的MLA, 每层都是固定内存分配的, 而不是动态分配的
         if attn_impl == "naive":
@@ -453,12 +460,13 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0: # 对q不先降维再升维(低秩压缩)
             # x: [batch_size, query_seq_len, hidden_dim]
             # wq:[dim, n_heads*qk_head_dim]
-            # => NOTE: 综过wq的列权重并行后, q的维度是n_local_head*qk_head_dim, 而不是n_head*qk_head_dim, 需要细细体会
+            # => NOTE: 通过wq的列权重并行后, q的维度是n_local_head*qk_head_dim, 而不是n_head*qk_head_dim, 需要细细体会
             # q: [batch_size, query_seq_len, n_local_heads*qk_head_dim]
             q = self.wq(x)
         else:
             # 对q使用MLA, 先降维再升维
-            # q: [batch_size, query_seq_len, n_heads*qk_head_dim]
+            # NOTE: wq_b为列并行
+            # q: [batch_size, query_seq_len, n_local_heads*qk_head_dim]
             q = self.wq_b(self.q_norm(self.wq_a(x)))
 
         # NOTE:当前rank上只有q的部分列,即 q: [batch_size, query_seq_len, n_local_head*qk_head_dim]
@@ -486,6 +494,7 @@ class MLA(nn.Module):
             # q: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim=192]
             q = torch.cat([q_nope, q_rope], dim=-1)
             # kv: [batch_size, seq_len, kv_lora_rank=512]
+            # NOTE: wkv_b升维, 列并行, 输出维度为: n_local_heads * (qk_nope_head_dim + v_head_dim), 而不是n_heads
             # => kv: [batch_size, seq_len, n_local_heads * (qk_nope_head_dim + v_head_dim)]
             kv = self.wkv_b(self.kv_norm(kv))
             # kv: [batch_size, seq_len, n_local_heads, (qk_nope_head_dim + v_head_dim)]
@@ -500,7 +509,7 @@ class MLA(nn.Module):
             # k: [batch_size, seq_len, n_local_heads, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim]
             k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # NOTE:这里k_rope进行广播，然后存储，浪费了内存
 
-            # NOTE: 这里只计算了start:end之间的kv cache, 而不是所有完整序钱的kv cache，在decode阶段，每次输入的seq_len=1,即只有一个token
+            # NOTE: 这里只计算了start:end之间的kv cache, 而不是所有完整序列的kv cache，在decode阶段，每次输入的seq_len=1,即只有一个token
             # k_cache: [batch_size, Key_seq_len, n_local_heads=16, qk_head_dim = qk_nope_head_dim + qk_rope_head_dim=192]
             # v_cache: [batch_size, key_seq_len, n_local_heads, v_head_dim=128]
             self.k_cache[:batch_size, start_pos:end_pos] = k # 更新kv cache缓存, 只更新当前位置的kv
@@ -514,7 +523,7 @@ class MLA(nn.Module):
             # scores:[batch_size, query_seq_len, head_num, key_seq_len]
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale # 除以/sqrt(dim)
         else:
-            # NOTE:默认, absorb, 将W(UQ)_i.T@ W(UK)_i吸收在同一个低维矩阵q_nope中
+            # NOTE:默认, absorb, 将 W(UQ)_i.T@ W(UK)_i吸收在同一个低维矩阵q_nope中
             # wkv_b: [n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank=512]
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
             # wkv_b: [n_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank=512]
@@ -544,19 +553,19 @@ class MLA(nn.Module):
             rope_score =torch.einsum("bshr,btr->bsht", q_rope, self.pe_cache[:batch_size, :end_pos])
 
             # 将带位置信息的向量和无位置信息的向量拼接在一起
-            # scores:[batch_size, query_seq_len, head_num, key_seq_len]
+            # scores:[batch_size, query_seq_len, n_local_heads, key_seq_len]
             scores = (nope_score + rope_score) * self.softmax_scale
 
         # 计算attention中的casual mask
         if mask is not None:
             scores += mask.unsqueeze(1) # mask掉的地方均为-inf
 
-        # scores:[batch_size, key_seq_len, head_num, key_seq_len]
+        # scores:[batch_size, key_seq_len, head_num=n_local_heads, key_seq_len]
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         if attn_impl == "naive":
             # 即[s,t] @ [t, d] => [s, d]
             # scores:[batch_size, query_seq_len, head_num=n_local_heads, key_seq_len]
-            # v: [batch_size, seq_len, n_local_heads, v_head_dim]
+            # v: [batch_size, key_seq_len, head_num=n_local_heads, v_head_dim]
             # => x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim]
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:batch_size, :end_pos])
         else:
@@ -578,6 +587,7 @@ class MLA(nn.Module):
         # x: [batch_size, query_seq_len, head_num=n_local_heads, v_head_dim=128]
         # x.flatten => [batch_size, query_seq_len, head_num * v_head_dim], 将所有head的拼接在一起,然后再进行线性变换
         # wo.T: [head_num * v_head_dim, dim=2048]
+        # NOTE:wo行并行, 需要将多个rank的矩阵结果相加即可得到原始值
         # => [batch_size, query_seq_len, dim=2048]
         x = self.wo(x.flatten(start_dim=2, end_dim=-1))
         return x
@@ -600,18 +610,22 @@ class MLP(nn.Module):
 
         llama: y = down( silu(gate(x)) * up(x) )
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+        silu(x) = x* sigmoid(x), 可以改善relu(x)中的梯度消失问题
+        or
+        silu(x) = x* 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         """
         return self.down_proj(F.silu(self.up_proj(x)) * self.gate_proj(x))
 
 
-class ExpertGate(nn.Module):
+class ExpertGateWeight(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
         self.topk = args.n_activated_experts # 激活6个专家
-        self.n_groups = args.n_expert_groups # 1
+        self.n_groups = args.n_expert_groups # 1, 专家分为多少组
         self.topk_groups = args.n_limited_groups # 1
-        self.score_func = args.score_func
+        self.score_func = args.score_func # 默认softmax
         self.route_scale = args.route_scale # 1
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
@@ -619,22 +633,23 @@ class ExpertGate(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # y= x@w.T + bias
         # x:[batch_size*seq_len, dim]
-        # scores:[batch_size*seq_len, n_routed_experts]
+        # scores:[batch_size*seq_len, n_routed_experts=64]
         scores = linear(x, self.weight)
-        if self.score_func == "softmax":
-            # scores:[batch_size*seq_len, n_routed_experts]
+        if self.score_func == "softmax": # 默认 softmax
+            # scores:[batch_size*seq_len, n_routed_experts=64]
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
+            # 但我实测过，sigmoid函数的topk效果并没有更好
             scores = scores.sigmoid()
 
-        # original_scores:[batch_size*seq_len, n_routed_experts]
+        # original_scores:[batch_size*seq_len, n_routed_experts=64]
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
 
         # 若有多个group
         if self.n_groups > 1:
-            # scores:[batch_size*seq_len, n_routed_experts]
+            # scores:[batch_size*seq_len, n_routed_experts=64]
             # => scores:[batch_size*seq_len, n_groups, n_routed_experts//n_groups]
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
@@ -647,17 +662,13 @@ class ExpertGate(nn.Module):
                 # group_scores:[batch_size*seq_len, n_groups]
                 group_scores = scores.amax(dim=-1) # amax会降维
             else:
-                # group_scores:[batch_size,*seq_len, n_groups]
+                # group_scores:[batch_size*seq_len, n_groups]
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # sum会降维
 
-            # topk_inds:[batch_size,*seq_len, n_groups]
+            # topk_inds:[batch_size*seq_len, topk_groups]
             topk_inds = group_scores.topk(self.topk_groups, dim=-1)[1]
 
             """
-            scores:[batch_size*seq_len, n_groups, n_routed_experts/n_groups]
-                => scores[...,0]是只取第0个group的score, [batch_size*seq_len, n_groups]
-            topk_inds:[batch_size,*seq_len, n_groups]
-            
             tensor.scatter_(dim, index, src):
             要求： src.shape == index.shape.
                 self[index[i][j][k]] [j][k] = src[i][j][k]  # if dim == 0
@@ -671,12 +682,16 @@ class ExpertGate(nn.Module):
                 out[i][j][k] = input[i][index[i][j][k]][k]  # if dim == 1
                 out[i][j][k] = input[i][j][index[i][j][k]]  # if dim == 2
 
+            scores:[batch_size*seq_len, n_groups, n_routed_experts/n_groups]
+                => scores[...,0]是只取第0个group的score, [batch_size*seq_len, n_groups]
+            topk_inds:[batch_size*seq_len, topk_groups]
+            
             =>
             mask:[batch_size*seq_len, n_groups]
             """
             mask = torch.zeros_like(scores[..., 0]).scatter_(dim=1, index=topk_inds, src=True)
             # scores:[batch_size*seq_len, n_groups, n_routed_experts/n_groups]
-            # => [batch_size*seq_len, n_routed_experts]
+            # => [batch_size*seq_len, n_routed_experts=64]
             scores = (scores * mask.unsqueeze(-1)).flatten(1) # mask=0处均被设为0
 
         # scores:[batch_size*seq_len, n_routed_experts=64]
@@ -684,6 +699,7 @@ class ExpertGate(nn.Module):
         topk_inds = torch.topk(scores, self.topk, dim=-1)[1]
 
         # 从dim=1上用indices去收集topk scores作为weights
+        # original_scores:[batch_size*seq_len, n_routed_experts=64]
         # weights:[batch_size*seq_len, topk=6]
         weights = original_scores.gather(dim=1, index=topk_inds)
         if self.score_func == "sigmoid":
@@ -717,10 +733,12 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts # 每个进程只处理部分专家
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.expert_gate = ExpertGate(args)
-        self.experts:List[Expert] = nn.ModuleList([Expert(args.dim, args.moe_intermediate_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                      for i in range(self.n_routed_experts)])
-        # 将多个专家的参数合并到一个MLP的中间层中了
+        self.expert_weight = ExpertGateWeight(args)
+        # NOTE:专家并行, 不同的专家放在不同的rank上
+        self.experts:List[Expert] = nn.ModuleList([Expert(args.dim, args.moe_intermediate_dim) \
+                                                       if self.experts_start_idx <= i < self.experts_end_idx else None \
+                                                            for i in range(self.n_routed_experts)])
+        # NOTE: 共享专家, 将多个专家的参数合并到一个MLP的中间层中了, 但并享专家内部是张量并行, 即MLP内部先列并行再行并行
         self.shared_experts = MLP(dim=args.dim, intermediate_dim=args.n_shared_experts * args.moe_intermediate_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -731,33 +749,34 @@ class MoE(nn.Module):
         """
         先对gate进行前向传播，从gate中选出每个token的topK的专家，然后只对各个token的topK的专家进行前向传播
         """
-        # gate_weights:[batch_size*seq_len, topk=6]
+        # expert_weights:[batch_size*seq_len, topk=6]
         # indices:[batch_size*seq_len, topk=6]
-        gate_weights, indices = self.expert_gate.forward(x)
+        expert_weights, indices = self.expert_weight.forward(x)
         # routed_experts_score: [batch*seq_len, dim]
         routed_experts_score = torch.zeros_like(x)
 
         """
         # 假设有 4 个专家（n_routed_experts = 4）
         self_n_routed_experts = 4
-        # indices 表示每个 token 被路由到哪个专家
-        indices = torch.tensor([[0, 1], [1, 3], [0, 2]])
+        # indices 表示每个 token 被路由到哪个专家, 每次选2个专家
+        indices = torch.tensor([[0, 1], 
+                                [1, 3], 
+                                [0, 2]])
         # 统计每个专家被选中的次数
         counts = torch.bincount(indices.flatten(), minlength=self_n_routed_experts).tolist()
         print(counts)  # 输出: [2, 2, 1, 1]
         """
-        # 给每个专家计数
+        # 分桶统计每个专家bin的计数
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
 
-        # NOTE： 1. 专家路由时，使用的是for,而不是固定的矩阵相乘后再mask, 这样可以节省计算量
+        # NOTE：1. 专家路由时，使用的是for,而不是固定的矩阵相乘后再mask, 这样可以节省计算量
         #       2. 此处使用了专家并行,只处理当前world_index上的专家, 不同的专家放在不同的rank上
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0: # 若该专家没有被选中，则跳过
                 continue
             expert = self.experts[i]
-            # indices:[batch_size*seq_len, topk=6]
             """
-            对于二维张量，它会返回两个一维张量：
+            对于二维张量，torch.where()它会返回两个一维张量：
                 sample_idx:第一个：满足条件的行索引（比如 batch 中的第几个样本）
                 select_expert_idx:第二个：满足条件的列索引（比如在 select_expert_idx-k 中的第几个位置）
                 
@@ -775,22 +794,29 @@ class MoE(nn.Module):
             print(select_expert_idx)  # tensor([1, 0, 0, 1])   -> 在这些样本中，是第1、0、0、1个位置
             所以专家 1 被样本 [0,1,3,3] 选中，分别是在它们的 select_expert_idx-k 路由中的第 [1,0,0,1] 位。
             """
+            # indices:[batch_size*seq_len, topk=6], 每个样本选择哪个专家
+            # sample_idx:[batch_size*seq_len]
+            # select_expert_idx:[batch_size*seq_len]
             sample_idx, select_expert_idx = torch.where(indices == i)
+
             # x: [batch*seq_len, dim]
             # x[sample_idx]: [token_idx, dim]
-            # gate_weights[token_idx, select_expert_idx].shape = [token_idx]
-            #  => gate_weights[token_idx, select_expert_idx, None] => [token_idx, 1]
             # expert_score: [token_idx, dim]
             expert_score = expert.forward(x[sample_idx])
-            # NOTE："+=", 这里是各专家对各样本的加权打分的累加
-            routed_experts_score[sample_idx] += expert_score * gate_weights[sample_idx, select_expert_idx, None]
 
-        # 还有一个共享专家，是一定需要计算的
+            # NOTE："+=", 这里是各专家对各样本token的加权打分的累加
+            # expert_score: [token_idx, dim]
+            # expert_weights[token_idx, select_expert_idx].shape = [token_idx]
+            #  => expert_weights[token_idx, select_expert_idx, None] => [token_idx, 1]
+            routed_experts_score[sample_idx] += expert_score * expert_weights[sample_idx, select_expert_idx, None]
+
+        if world_size > 1: # NOTE: 专家并行，将各个路由专家对token的打分sum在一起
+            dist.all_reduce(routed_experts_score, op=dist.ReduceOp.SUM)
+
+        # NOTE:还有一个共享专家，是每次都需要计算的, 共享专家内部是张量并行, 所以不会在各rank中重复
         # x: [batch*seq_len, dim]
         # shared_experts_score: [batch*seq_len, dim]
         shared_experts_score = self.shared_experts.forward(x)
-        if world_size > 1:
-            dist.all_reduce(routed_experts_score, op=dist.ReduceOp.SUM)
         # routed_experts_score: [batch*seq_len, dim]
         # shared_experts_score: [batch*seq_len, dim]
         # => return [batch, seq_len, dim]
@@ -798,10 +824,13 @@ class MoE(nn.Module):
         return (routed_experts_score + shared_experts_score).view(shape)
 
 
-class Block(nn.Module):
+class Layer(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.attn = MLA(args)
+        # NOTE: 只有前面n_dense_layers个layer使用MLP, 后面的layer使用MoE
+        #   MLP: 张量并行 = 列并行 + 行并行
+        #   MOE: 路由专家并行 + 共享专家张量并行
         self.ffn = MLP(args.dim, args.intermediate_size) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
@@ -825,14 +854,17 @@ class Transformer(nn.Module):
         rank = dist.get_rank() if dist.is_initialized() else 0
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
+
         self.max_seq_len = args.max_seq_len
+        # NOTE: embedding行并行 - 张量并行
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
-        self.layers:List[Block] = torch.nn.ModuleList()
+        self.layers:List[Layer] = torch.nn.ModuleList()
 
         for layer_id in range(args.n_layers):
-            self.layers.append(Block(layer_id, args))
+            self.layers.append(Layer(layer_id, args))
 
         self.norm = RMSNorm(args.dim)
+        # NOTE: lm_head列并行 - 张量并行
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
@@ -853,11 +885,13 @@ class Transformer(nn.Module):
             h = layer.forward(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h)[:, -1]
-        logits = self.head(h)
+        # NOTE: lm_head为列并行
+        logits = self.head(h) # logits: [batch, vocab_size//world_size]
         if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, dim=-1)
+            all_logit_list = [torch.empty_like(logits) for _ in range(world_size)]
+            # 将各个rank计算的logits收集至all_logit_list中
+            dist.all_gather(all_logit_list, logits)
+            logits = torch.cat(all_logit_list, dim=-1)
         return logits
 
 
