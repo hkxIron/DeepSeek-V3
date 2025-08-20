@@ -321,7 +321,29 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     # freq shape: [dim / 2], 其值为: 1 / [ 10000 ^ (even_dim_index / dim) ], 只取偶数维度,
     # NOTE: 但freqs在tranformer的llama源码中叫inv_freqs, 但叫法并不准确，应访是频率
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    # NOTE:使用yarn rope
+
+    """
+    所有⻓度扩展⽅法PI,NTK-aware,Yarn RoPE等，本质上都是通过缩⼩旋转弧度:m*theta(i) = m*base^(-2i/dim)，以达到⻓度扩展的⽬的
+    
+    NTK-aware Interpolation中，根据维度来降低旋转弧度，
+    m*theta(i) = m*(base*alpha)^(-2i/dim) = m*(10000*alpha)^(-2i/dim)
+    
+    code_llama中，alpha=100,即将原始模型的base放大100倍，调整后的旋转弧度与原始旋转弧度的倍数关系如下:
+    调整后旋转弧度/原始旋转弧度 = (10000*alpha)^(-2i/dim) / 10000^(-2i/dim) = alpha^(-2i/dim) 
+    
+    NTK:在旋转角度上缩小，跟位置无关
+    低维：i=0, 100^(0)=1,倍数=1
+    高维：i=d/2,100^(-d/d)=0.01,角度为原来的1/100
+    
+    可以将NTK-Aware Interpolation的思想总结为：
+    1.保留⾼频信息；⾼频分量旋转速度降幅低，低频分量旋转速度降幅⾼；
+    2.在⾼频部分进⾏外推，低频部分进⾏内插。
+    
+    我们可以将NTK-Aware Interpolation奏效的原因按照如下⽅式进⾏解释：
+    1. 低维度即靠前的分组，在训练中⻅过⾮常多完整的旋转周期，位置信息得到了充分的训练，所以具有较强的外推能⼒。
+    2. 高维度即靠后的分组，在训练中⽆法⻅到完整的旋转周期，或者⻅到的旋转周期⾮常少，训练不够充分，外推性能弱，需要进⾏位置插值。 
+    """
+    # NOTE:使用yarn rope,但只对位置超过原训练长度的序列进行调整
     if seqlen > args.original_seq_len:
         low_dim_of_fast_rotation, high_dim_of_low_rotation = find_correction_range(beta_fast_rotation, beta_slow_ratation, dim, base=base, max_seq_len=args.original_seq_len)
         """
