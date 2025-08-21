@@ -904,6 +904,7 @@ class Transformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(diagonal=1)
 
         for layer in self.layers:
+            # NOTE: rope位置信息在每个layer中都使用,而不仅仅是第一层
             h = layer.forward(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h)[:, -1]
